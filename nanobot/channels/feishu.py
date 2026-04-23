@@ -258,6 +258,7 @@ class FeishuConfig(Base):
     reply_to_message: bool = False  # If True, bot replies quote the user's original message
     streaming: bool = True
     domain: Literal["feishu", "lark"] = "feishu"  # Set to "lark" for international Lark
+    latex_rendering: bool = False  # Enable LaTeX rendering (GIF images for math formulas)
 
 
 _STREAM_ELEMENT_ID = "streaming_md"
@@ -271,6 +272,73 @@ class _FeishuStreamBuf:
     card_id: str | None = None
     sequence: int = 0
     last_edit: float = 0.0
+    # LaTeX buffer: accumulates partial formula characters until $ is closed
+    latex_buf: str = ""
+
+
+def _flush_latex_buffer(buf: _FeishuStreamBuf, delta: str, final: bool) -> str:
+    """Buffer streaming LaTeX $...$ until complete (or stream ends).
+
+    Returns the text that should be immediately flushed to buf.text.
+    Incomplete formulas accumulate in buf.latex_buf and are returned on
+    subsequent calls (empty string when nothing to flush yet).
+
+    Rules:
+      - \\$  → kept as-is (latex_buf) — will become literal $ in rendered formula
+      - $...$ → passed through immediately when both $s are present in same delta
+      - lone $ → buffer until the closing $ arrives
+      - $$...$$ → display math — pass through immediately (never buffered)
+    """
+    result_parts: list[str] = []
+    i = 0
+
+    while i < len(delta):
+        c = delta[i]
+
+        # Handle escaped dollar \$
+        if c == "\\" and i + 1 < len(delta) and delta[i + 1] == "$":
+            # Escaped dollar — accumulate into latex_buf if in formula, else emit
+            if buf.latex_buf != "":
+                buf.latex_buf += "\\$"
+            else:
+                result_parts.append("\\$")
+            i += 2
+            continue
+
+        if c == "$":
+            if i + 1 < len(delta) and delta[i + 1] == "$":
+                # $$...$$ — display math, pass through immediately
+                end = delta.find("$$", i + 2)
+                if end == -1:
+                    # Unclosed $$ — pass through $$ and remaining as buffer
+                    result_parts.append("$$")
+                    buf.latex_buf = delta[i + 2 :]
+                    i = len(delta)
+                    continue
+                else:
+                    result_parts.append(delta[i : end + 2])
+                    i = end + 2
+                    continue
+            else:
+                # Single $ — toggle in/out of formula mode
+                if buf.latex_buf == "":
+                    # Enter formula mode: don't emit anything yet
+                    buf.latex_buf = ""
+                else:
+                    # Exit formula mode: emit complete formula
+                    result_parts.append("$" + buf.latex_buf + "$")
+                    buf.latex_buf = ""
+                i += 1
+                continue
+
+        # Regular character — accumulate to formula buffer or result
+        if buf.latex_buf != "":
+            buf.latex_buf += c
+        else:
+            result_parts.append(c)
+        i += 1
+
+    return "".join(result_parts)
 
 
 class FeishuChannel(BaseChannel):
@@ -604,6 +672,156 @@ class FeishuChannel(BaseChannel):
 
     _CODE_BLOCK_RE = re.compile(r"(```[\s\S]*?```)", re.MULTILINE)
 
+    # Cache for LaTeX images to avoid re-uploading identical formulas
+    _latex_img_cache: dict = {}
+
+    # ── LaTeX → image helpers ─────────────────────────────────────────────
+
+    @staticmethod
+    def _placeholder(storage: list, text: str) -> str:
+        """Replace text with a placeholder, store original in storage."""
+        storage.append(text)
+        return f"\x00LATEX{len(storage) - 1}\x00"
+
+    def _math_to_img_elements(self, content: str) -> list[dict]:
+        """Replace $$...$$ and $...$ with img elements, interleaved with text content.
+
+        Returns a list of Feishu elements (mix of markdown and img) for rendering.
+        Requires self.config.latex_rendering to be True.
+        """
+        # Skip LaTeX rendering if disabled
+        if not getattr(self.config, 'latex_rendering', False):
+            return [{"tag": "markdown", "content": content}]
+        # ── Step 0: Escape \$ → §DOLLAR§ (placeholder) before regex matching ──
+        escape_re = self._LATEX_ESCAPE_RE
+        escapes: list[tuple[str, str]] = []
+        def _make_placeholder(m: re.Match) -> str:
+            placeholder = f"\x00DOLLAR{len(escapes)}\x00"
+            escapes.append((placeholder, "$"))
+            return placeholder
+        content = escape_re.sub(_make_placeholder, content)
+        import base64
+
+        # ── Reject formulas containing unescaped quotes ──────────────────────
+        # Build set of formula positions to skip (avoids mutating content mid-iteration)
+        QUOTES = ('"', '"', "'", "'")
+        skip_ranges: set[tuple[int, int]] = set()
+        for m in self._INLINE_MATH_RE.finditer(content):
+            if any(p in m.group(1) for p in QUOTES):
+                skip_ranges.add((m.start(), m.end()))
+                logger.debug("[FeishuFormatter] Skipping inline LaTeX render for formula with unescaped quotes: {}", m.group(1)[:50])
+        for m in self._DISPLAY_MATH_RE.finditer(content):
+            if any(p in m.group(1) for p in QUOTES):
+                skip_ranges.add((m.start(), m.end()))
+                logger.debug("[FeishuFormatter] Skipping display math render for formula with unescaped quotes: {}", m.group(1)[:50])
+        elements: list[dict] = []
+        last_end = 0
+
+        # Combined iterator over both display and inline math
+        # Display math ($$...$$) is always processed
+        # Inline math ($...$) requires LaTeX indicators (Greek, \sum, brackets)
+        all_matches: list[tuple[re.Match, str, int, int]] = []
+        for m in self._DISPLAY_MATH_RE.finditer(content):
+            if (m.start(), m.end()) not in skip_ranges:
+                all_matches.append((m, "display", 480, 64))
+        for m in self._INLINE_MATH_RE.finditer(content):
+            latex = m.group(1).strip()
+            # Only process inline math if it contains LaTeX indicators and not blocked
+            if (m.start(), m.end()) not in skip_ranges and self._LATEX_INDICATOR_RE.search(latex):
+                all_matches.append((m, "inline", 240, 36))
+        all_matches.sort(key=lambda x: x[0].start())
+
+        for m, kind, w, h in all_matches:
+            before = content[last_end : m.start()]
+            if before.strip():
+                elements.append({"tag": "markdown", "content": before})
+            latex = m.group(1).strip()
+            encoded = base64.urlsafe_b64encode(latex.encode("utf-8")).decode()
+            key = ""
+            if encoded in self._latex_img_cache:
+                key = self._latex_img_cache[encoded]
+            else:
+                # Fetch LaTeX image via CodeCogs
+                import urllib.request, urllib.parse, ssl
+                dpi = 300
+                url = f"https://latex.codecogs.com/png.latex?\\dpi{{{dpi}}}" + urllib.parse.quote(latex, safe='')
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                ctx = ssl._create_unverified_context()
+                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                    img_bytes = resp.read()
+
+                # Upload via the same pattern as _upload_image_sync
+                import tempfile, os as _os
+                key = ""
+                try:
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
+                        tmp.write(img_bytes)
+                        tmp_path = tmp.name
+                    logger.debug("[FeishuFormatter] UTeX PNG ({}) {} bytes", dpi, len(img_bytes), tmp_path)
+                    key = self._upload_image_sync(tmp_path)
+                    logger.debug("[FeishuFormatter] LaTeX PNG upload result: {!r}", key)
+                    if key:
+                        self._latex_img_cache[encoded] = key
+                except Exception as e:
+                    logger.warning("[FeishuFormatter] LaTeX PNG upload failed for '{}': {}", latex, e)
+                finally:
+                    try:
+                        _os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            if key:
+                elements.append({
+                    "tag": "img",
+                    "img_key": key,
+                    "width": w,
+                    "height": h,
+                    "alt": {"tag": "plain_text", "content": latex},
+                })
+            else:
+                elements.append({"tag": "markdown", "content": f"[公式: {latex}]"})
+            last_end = m.end()
+
+        remaining = content[last_end:]
+        if remaining.strip():
+            elements.append({"tag": "markdown", "content": remaining})
+
+        # ── Restore escaped \$ in all markdown elements ──────────────────────
+        if escapes:
+            for el in elements:
+                if el.get("tag") == "markdown":
+                    text = el["content"]
+                    for placeholder, dollar in escapes:
+                        text = text.replace(placeholder, dollar)
+                    el["content"] = text
+        return elements
+
+    def _restore_code_blocks(self, elements: list[dict], storage: list[str]) -> list[dict]:
+        """Restore code blocks that were temporarily replaced with placeholders."""
+        for i, block in enumerate(storage):
+            placeholder = f"\x00CODE{i}\x00"
+            for el in elements:
+                if el.get("tag") == "markdown":
+                    el["content"] = el["content"].replace(placeholder, block)
+        return elements
+
+    # LaTeX math patterns
+    # Display math: $$...$$
+    _DISPLAY_MATH_RE = re.compile(r"\$\$([\s\S]+?)\$\$")
+    # Inline math: $...$
+    # Stricter regex: require opening $ to be followed by non-digit, and content must contain
+    # LaTeX indicators (Greek letters, \sum, \prod, or brackets)
+    _INLINE_MATH_RE = re.compile(
+        r"(?<!\$)\$(?!\$)"                    # Opening $ (not preceded/followed by $)
+        r"([^\s\d][^$\n]*?)"                   # First char must be non-digit, non-space
+        r"(?<!\$)\$(?!\$)"                    # Closing $ (not preceded/followed by $)
+    )
+    # Regex to check if text contains LaTeX indicators (Greek letters, \sum, \prod, brackets)
+    _LATEX_INDICATOR_RE = re.compile(
+        r'\\[a-zA-Z]+|'                        # LaTeX commands like \alpha, \sum, \frac
+        r'[α-ωΑ-Ω]|'                           # Greek letters (Unicode)
+        r'[()[]{}\\]'                           # Brackets
+    )
+
     # Markdown formatting patterns that should be stripped from plain-text
     # surfaces like table cells and heading text.
     _MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
@@ -625,6 +843,10 @@ class FeishuChannel(BaseChannel):
         text = cls._MD_ITALIC_RE.sub(r"\1", text)
         # Remove strikethrough markers
         text = cls._MD_STRIKE_RE.sub(r"\1", text)
+        # Remove display math $$...$$
+        text = re.sub(r"\$\$([\s\S]+?)\$\$", r"\1", text)
+        # Remove inline math $...$
+        text = re.sub(r"(?<!\$)\$(?!\$)([^$\n]+?)(?<!\$)\$(?!\$)", r"\1", text)
         return text
 
     @classmethod
@@ -653,19 +875,23 @@ class FeishuChannel(BaseChannel):
         }
 
     def _build_card_elements(self, content: str) -> list[dict]:
-        """Split content into div/markdown + table elements for Feishu card."""
-        elements, last_end = [], 0
+        """Split content into div/markdown + table + img elements for Feishu card.
+
+        LaTeX formulas ($$...$$ and $...$) are converted to images via codecogs API.
+        """
+        elements: list[dict] = []
+        last_end = 0
         for m in self._TABLE_RE.finditer(content):
             before = content[last_end : m.start()]
             if before.strip():
-                elements.extend(self._split_headings(before))
+                elements.extend(self._math_to_img_elements(before))
             elements.append(
                 self._parse_md_table(m.group(1)) or {"tag": "markdown", "content": m.group(1)}
             )
             last_end = m.end()
         remaining = content[last_end:]
         if remaining.strip():
-            elements.extend(self._split_headings(remaining))
+            elements.extend(self._math_to_img_elements(remaining))
         return elements or [{"tag": "markdown", "content": content}]
 
     @staticmethod
@@ -684,14 +910,15 @@ class FeishuChannel(BaseChannel):
         current: list[dict] = []
         table_count = 0
         for el in elements:
-            if el.get("tag") == "table":
+            if el.get("tag") in ("table", "img"):
                 if table_count >= max_tables:
                     if current:
                         groups.append(current)
                     current = []
                     table_count = 0
                 current.append(el)
-                table_count += 1
+                if el.get("tag") == "table":
+                    table_count += 1
             else:
                 current.append(el)
         if current:
@@ -738,9 +965,7 @@ class FeishuChannel(BaseChannel):
     # ── Smart format detection ──────────────────────────────────────────
     # Patterns that indicate "complex" markdown needing card rendering
     _COMPLEX_MD_RE = re.compile(
-        r"```"  # fenced code block
-        r"|^\|.+\|.*\n\s*\|[-:\s|]+\|"  # markdown table (header + separator)
-        r"|^#{1,6}\s+",  # headings
+        r"```|^\|.+\|.*\n\s*\|[-:\s|]+\||^#{1,6}\s+|\$\$[\s\S]+?\$\$|\$[^$\n]+?\$",
         re.MULTILINE,
     )
 
@@ -752,6 +977,10 @@ class FeishuChannel(BaseChannel):
         r"|~~.+?~~",  # ~~strikethrough~~
         re.DOTALL,
     )
+
+    # ── LaTeX streaming buffer ───────────────────────────────────────────────
+    # Escaped dollar sign \$
+    _LATEX_ESCAPE_RE = re.compile(r"\\\$")
 
     # Markdown link: [text](url)
     _MD_LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^\)]+)\)")
@@ -853,7 +1082,7 @@ class FeishuChannel(BaseChannel):
         return json.dumps(post_body, ensure_ascii=False)
 
     _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".ico", ".tiff", ".tif"}
-    _AUDIO_EXTS = {".opus"}
+    _AUDIO_EXTS = {".opus", ".wav", ".mp3", ".m4a", ".aac", ".ogg"}
     _VIDEO_EXTS = {".mp4", ".mov", ".avi"}
     _FILE_TYPE_MAP = {
         ".opus": "opus",
@@ -865,6 +1094,13 @@ class FeishuChannel(BaseChannel):
         ".xlsx": "xls",
         ".ppt": "ppt",
         ".pptx": "ppt",
+        ".txt": "txt",
+        ".csv": "csv",
+        ".zip": "zip",
+        ".rar": "rar",
+        ".wav": "opus",  # GPT-SoVITS outputs WAV, Feishu needs opus
+        ".mp3": "mp3",
+        ".m4a": "m4a",
     }
 
     def _upload_image_sync(self, file_path: str) -> str | None:
@@ -926,6 +1162,38 @@ class FeishuChannel(BaseChannel):
                     return None
         except Exception as e:
             logger.error("Error uploading file {}: {}", file_path, e)
+            return None
+
+    def _upload_audio_sync(self, file_path: str) -> str | None:
+        """Upload an audio file to Feishu as 'opus' type and return the file_key."""
+        from lark_oapi.api.im.v1 import CreateFileRequest, CreateFileRequestBody
+
+        file_name = os.path.basename(file_path)
+        try:
+            with open(file_path, "rb") as f:
+                request = (
+                    CreateFileRequest.builder()
+                    .request_body(
+                        CreateFileRequestBody.builder()
+                        .file_type("opus")  # Feishu requires opus for audio messages
+                        .file_name(file_name)
+                        .file(f)
+                        .build()
+                    )
+                    .build()
+                )
+                response = self._client.im.v1.file.create(request)
+                if response.success():
+                    file_key = response.data.file_key
+                    logger.debug("Uploaded audio {}: {}", file_name, file_key)
+                    return file_key
+                else:
+                    logger.error(
+                        "Failed to upload audio: code={}, msg={}", response.code, response.msg
+                    )
+                    return None
+        except Exception as e:
+            logger.error("Error uploading audio {}: {}", file_path, e)
             return None
 
     def _download_image_sync(
@@ -1149,14 +1417,25 @@ class FeishuChannel(BaseChannel):
                 )
                 .build()
             )
-            response = self._client.im.v1.message.create(request)
+            if "img" in content and len(content) > 200:
+                import re
+                imgs = re.findall(r'"tag"\s*:\s*"img"[^}]+}', content)
+                for img in imgs:
+                    logger.debug("[Feishu] img element in content: {}", img)
+            logger.debug("[Feishu] _send_message_sync: type={}, receive_id={}", msg_type, receive_id)
+            try:
+                response = self._client.im.v1.message.create(request)
+            except Exception as e:
+                logger.error("[Feishu] HTTP request failed: {} | content[:1000]={}", e, content[:1000])
+                raise
             if not response.success():
                 logger.error(
-                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}",
+                    "Failed to send Feishu {} message: code={}, msg={}, log_id={}, content={}",
                     msg_type,
                     response.code,
                     response.msg,
                     response.get_log_id(),
+                    content[:500],
                 )
                 return None
             msg_id = getattr(response.data, "message_id", None)
@@ -1309,6 +1588,10 @@ class FeishuChannel(BaseChannel):
                     await self._add_reaction(message_id, self.config.done_emoji)
 
             buf = self._stream_bufs.pop(chat_id, None)
+            # Final flush: drain any remaining LaTeX buffer
+            if buf and buf.latex_buf:
+                buf.text += buf.latex_buf
+                buf.latex_buf = ""
             if not buf or not buf.text:
                 return
             # Try to finalize via streaming card; if that fails (e.g.
@@ -1343,17 +1626,21 @@ class FeishuChannel(BaseChannel):
                     {"config": {"wide_screen_mode": True}, "elements": chunk},
                     ensure_ascii=False,
                 )
+                logger.debug("[Feishu] Sending card JSON ({} elements): {}", len(chunk), card[:300])
                 await loop.run_in_executor(
                     None, self._send_message_sync, rid_type, chat_id, "interactive", card
                 )
             return
 
-        # --- accumulate delta ---
+        # --- accumulate delta (with LaTeX buffering) ---
         buf = self._stream_bufs.get(chat_id)
         if buf is None:
             buf = _FeishuStreamBuf()
             self._stream_bufs[chat_id] = buf
-        buf.text += delta
+
+        # Pass False = not final flush
+        flushed_text = _flush_latex_buffer(buf, delta, final=False)
+        buf.text += flushed_text
         if not buf.text.strip():
             return
 
@@ -1410,9 +1697,10 @@ class FeishuChannel(BaseChannel):
                     ]},
                     ensure_ascii=False,
                 )
+                logger.debug("[Feishu] Sending tool hint card: {}", card[:300])
                 await loop.run_in_executor(
-                    None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
-                )
+                                        None, self._send_message_sync, receive_id_type, msg.chat_id, "interactive", card
+                                    )
                 return
 
             # Determine whether the first message should quote the user's message.
@@ -1497,6 +1785,34 @@ class FeishuChannel(BaseChannel):
                             "interactive",
                             json.dumps(card, ensure_ascii=False),
                         )
+
+            # TTS for non-streaming messages (only when not streamed and has text content)
+            if (
+                self.tts
+                and self.tts.enabled
+                and msg.content
+                and msg.content.strip()
+                and not msg.metadata.get("_streamed")
+                and not msg.metadata.get("_progress")
+            ):
+                audio_path = await self.tts.synthesize(msg.content.strip())
+                if audio_path and os.path.isfile(audio_path):
+                    try:
+                        key = await loop.run_in_executor(None, self._upload_audio_sync, audio_path)
+                        if key:
+                            await loop.run_in_executor(
+                                None,
+                                _do_send,
+                                "audio",
+                                json.dumps({"file_key": key}, ensure_ascii=False),
+                            )
+                    except Exception as e:
+                        logger.warning("TTS audio send failed: {}", e)
+                    finally:
+                        try:
+                            os.unlink(audio_path)
+                        except Exception:
+                            pass
 
         except Exception as e:
             logger.error("Error sending Feishu message: {}", e)
