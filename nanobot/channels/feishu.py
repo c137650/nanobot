@@ -708,7 +708,7 @@ class FeishuChannel(BaseChannel):
         # The key insight: if someone writes "$x^2" they likely mean LaTeX; but if they write
         # "$hello "world" test" the quotes indicate text, not a formula.
         # We only check for quotes to detect text-vs-formula ambiguity.
-        QUOTES = ('"', '"', "'", "'", '“', '”','‘','’','，')
+        QUOTES = ('"', "`", '“', '”','‘','’','，') 
         skip_ranges: set[tuple[int, int]] = set()
         for m in self._INLINE_MATH_RE.finditer(content):
             formula = m.group(1)
@@ -748,29 +748,22 @@ class FeishuChannel(BaseChannel):
             if encoded in self._latex_img_cache:
                 key = self._latex_img_cache[encoded]
             else:
-                # Fetch LaTeX image via CodeCogs
-                import urllib.request, urllib.parse, ssl
+                import urllib.request, urllib.parse, ssl, tempfile, os as _os
                 dpi = 300
                 url = f"https://latex.codecogs.com/png.latex?\\dpi{{{dpi}}}" + urllib.parse.quote(latex, safe='')
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 ctx = ssl._create_unverified_context()
-                with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
-                    img_bytes = resp.read()
-
-                # Upload via the same pattern as _upload_image_sync
-                import tempfile, os as _os
-                key = ""
                 try:
+                    with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+                        img_bytes = resp.read()
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                         tmp.write(img_bytes)
                         tmp_path = tmp.name
-                    logger.debug("[FeishuFormatter] UTeX PNG ({}) {} bytes", dpi, len(img_bytes), tmp_path)
                     key = self._upload_image_sync(tmp_path)
-                    logger.debug("[FeishuFormatter] LaTeX PNG upload result: {!r}", key)
                     if key:
                         self._latex_img_cache[encoded] = key
                 except Exception as e:
-                    logger.warning("[FeishuFormatter] LaTeX PNG upload failed for '{}': {}", latex, e)
+                    logger.warning("[FeishuFormatter] LaTeX PNG failed for '{}': {}", latex, e)
                 finally:
                     try:
                         _os.unlink(tmp_path)
@@ -1768,13 +1761,13 @@ class FeishuChannel(BaseChannel):
                 else:
                     key = await loop.run_in_executor(None, self._upload_file_sync, file_path)
                     if key:
-                        # Feishu's OpenAPI names video messages "media".
-                        # Use "audio" for audio, "media" for video, "file" for documents.
+                        # Use msg_type "audio" for audio, "video" for video, "file" for documents.
                         # Feishu requires these specific msg_types for inline playback.
+                        # Note: "media" is only valid as a tag inside "post" messages, not as a standalone msg_type.
                         if ext in self._AUDIO_EXTS:
                             media_type = "audio"
                         elif ext in self._VIDEO_EXTS:
-                            media_type = "media"
+                            media_type = "video"
                         else:
                             media_type = "file"
                         await loop.run_in_executor(
